@@ -210,17 +210,22 @@ impl<'a, 'hir> NodeCollector<'a, 'hir> {
                     None => format!("{:?}", node)
                 };
 
-                if hir_id == ::hir::DUMMY_HIR_ID {
-                    debug!("Maybe you forgot to lower the node id {:?}?", id);
-                }
+                let forgot_str = if hir_id == ::hir::DUMMY_HIR_ID {
+                    format!("\nMaybe you forgot to lower the node id {:?}?", id)
+                } else {
+                    String::new()
+                };
 
                 bug!("inconsistent DepNode for `{}`: \
-                      current_dep_node_owner={}, hir_id.owner={}",
+                      current_dep_node_owner={} ({:?}), hir_id.owner={} ({:?}) {}",
                     node_str,
                     self.definitions
                         .def_path(self.current_dep_node_owner)
                         .to_string_no_crate(),
-                    self.definitions.def_path(hir_id.owner).to_string_no_crate())
+                    self.current_dep_node_owner,
+                    self.definitions.def_path(hir_id.owner).to_string_no_crate(),
+                    hir_id.owner,
+                    forgot_str)
             }
         }
 
@@ -314,6 +319,12 @@ impl<'a, 'hir> Visitor<'hir> for NodeCollector<'a, 'hir> {
                 }
                 intravisit::walk_item(this, i);
             });
+        });
+    }
+
+    fn visit_use(&mut self, path: &'hir Path, id: NodeId, hir_id: HirId) {
+        self.with_dep_node_owner(hir_id.owner, path, |this| {
+            intravisit::walk_use(this, path, id, hir_id)
         });
     }
 

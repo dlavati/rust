@@ -1065,6 +1065,9 @@ impl<'a> LoweringContext<'a> {
     }
 
     fn lower_attr(&mut self, attr: &Attribute) -> Attribute {
+        // Note that we explicitly do not walk the path. Since we don't really
+        // lower attributes (we use the AST version) there is nowhere to keep
+        // the HirIds. We don't actually need HIR version of attributes anyway.
         Attribute {
             id: attr.id,
             style: attr.style,
@@ -1678,6 +1681,7 @@ impl<'a> LoweringContext<'a> {
                         num_lifetimes,
                         parenthesized_generic_args,
                         itctx.reborrow(),
+                        None,
                     )
                 })
                 .collect(),
@@ -1721,6 +1725,7 @@ impl<'a> LoweringContext<'a> {
                 0,
                 ParenthesizedGenericArgs::Warn,
                 itctx.reborrow(),
+                None,
             ));
             let qpath = hir::QPath::TypeRelative(ty, segment);
 
@@ -1749,6 +1754,7 @@ impl<'a> LoweringContext<'a> {
         p: &Path,
         ident: Option<Ident>,
         param_mode: ParamMode,
+        explicit_owner: Option<NodeId>,
     ) -> hir::Path {
         hir::Path {
             def,
@@ -1762,6 +1768,7 @@ impl<'a> LoweringContext<'a> {
                         0,
                         ParenthesizedGenericArgs::Err,
                         ImplTraitContext::disallowed(),
+                        explicit_owner,
                     )
                 })
                 .chain(ident.map(|ident| hir::PathSegment::from_ident(ident)))
@@ -1772,7 +1779,7 @@ impl<'a> LoweringContext<'a> {
 
     fn lower_path(&mut self, id: NodeId, p: &Path, param_mode: ParamMode) -> hir::Path {
         let def = self.expect_full_def(id);
-        self.lower_path_extra(def, p, None, param_mode)
+        self.lower_path_extra(def, p, None, param_mode, None)
     }
 
     fn lower_path_segment(
@@ -1783,6 +1790,7 @@ impl<'a> LoweringContext<'a> {
         expected_lifetimes: usize,
         parenthesized_generic_args: ParenthesizedGenericArgs,
         itctx: ImplTraitContext<'_>,
+        explicit_owner: Option<NodeId>,
     ) -> hir::PathSegment {
         let (mut generic_args, infer_types) = if let Some(ref generic_args) = segment.args {
             let msg = "parenthesized parameters may only be used with a trait";
@@ -1854,9 +1862,15 @@ impl<'a> LoweringContext<'a> {
         }
 
         let def = self.expect_full_def(segment.id);
+        let id = if let Some(owner) = explicit_owner {
+            self.lower_node_id_with_owner(segment.id, owner)
+        } else {
+            self.lower_node_id(segment.id)
+        };
+
         hir::PathSegment::new(
             segment.ident,
-            Some(segment.id),
+            Some(id.node_id),
             Some(def),
             generic_args,
             infer_types,
@@ -2921,6 +2935,12 @@ impl<'a> LoweringContext<'a> {
         attrs: &hir::HirVec<Attribute>,
     ) -> hir::ItemKind {
         let path = &tree.prefix;
+        let segments = prefix
+            .segments
+            .iter()
+            .chain(path.segments.iter())
+            .cloned()
+            .collect();
 
         match tree.kind {
             UseTreeKind::Simple(rename, id1, id2) => {
@@ -2928,12 +2948,7 @@ impl<'a> LoweringContext<'a> {
 
                 // First apply the prefix to the path
                 let mut path = Path {
-                    segments: prefix
-                        .segments
-                        .iter()
-                        .chain(path.segments.iter())
-                        .cloned()
-                        .collect(),
+                    segments,
                     span: path.span,
                 };
 
@@ -2953,9 +2968,18 @@ impl<'a> LoweringContext<'a> {
                 // for later
                 let ret_def = defs.next().unwrap_or(Def::Err);
 
+                // Here, we are looping over namespaces, if they exist for the definition
+                // being imported. We only handle type and value namespaces because we
+                // won't be dealing with macros in the rest of the compiler.
+                // Essentially a single `use` which imports two names is desugared into
+                // two imports.
                 for (def, &new_node_id) in defs.zip([id1, id2].iter()) {
                     let vis = vis.clone();
                     let name = name.clone();
+                    let mut path = path.clone();
+                    for seg in &mut path.segments {
+                        seg.id = self.sess.next_node_id();
+                    }
                     let span = path.span;
                     self.resolver.definitions().create_def_with_parent(
                         parent_def_index,
@@ -2968,7 +2992,8 @@ impl<'a> LoweringContext<'a> {
 
                     self.with_hir_id_owner(new_node_id, |this| {
                         let new_id = this.lower_node_id(new_node_id);
-                        let path = this.lower_path_extra(def, &path, None, ParamMode::Explicit);
+                        let path =
+                            this.lower_path_extra(def, &path, None, ParamMode::Explicit, None);
                         let item = hir::ItemKind::Use(P(path), hir::UseKind::Single);
                         let vis_kind = match vis.node {
                             hir::VisibilityKind::Public => hir::VisibilityKind::Public,
@@ -2978,7 +3003,6 @@ impl<'a> LoweringContext<'a> {
                                 let id = this.next_id();
                                 hir::VisibilityKind::Restricted {
                                     path: path.clone(),
-                                    // We are allocating a new NodeId here
                                     id: id.node_id,
                                     hir_id: id.hir_id,
                                 }
@@ -3001,19 +3025,15 @@ impl<'a> LoweringContext<'a> {
                     });
                 }
 
-                let path = P(self.lower_path_extra(ret_def, &path, None, ParamMode::Explicit));
+                let path =
+                    P(self.lower_path_extra(ret_def, &path, None, ParamMode::Explicit, None));
                 hir::ItemKind::Use(path, hir::UseKind::Single)
             }
             UseTreeKind::Glob => {
                 let path = P(self.lower_path(
                     id,
                     &Path {
-                        segments: prefix
-                            .segments
-                            .iter()
-                            .chain(path.segments.iter())
-                            .cloned()
-                            .collect(),
+                        segments,
                         span: path.span,
                     },
                     ParamMode::Explicit,
@@ -3021,19 +3041,17 @@ impl<'a> LoweringContext<'a> {
                 hir::ItemKind::Use(path, hir::UseKind::Glob)
             }
             UseTreeKind::Nested(ref trees) => {
+                // Nested imports are desugared into simple imports.
+
                 let prefix = Path {
-                    segments: prefix
-                        .segments
-                        .iter()
-                        .chain(path.segments.iter())
-                        .cloned()
-                        .collect(),
+                    segments,
                     span: prefix.span.to(path.span),
                 };
 
-                // Add all the nested PathListItems in the HIR
+                // Add all the nested PathListItems to the HIR.
                 for &(ref use_tree, id) in trees {
                     self.allocate_hir_id_counter(id, &use_tree);
+
                     let LoweredNodeId {
                         node_id: new_id,
                         hir_id: new_hir_id,
@@ -3041,10 +3059,26 @@ impl<'a> LoweringContext<'a> {
 
                     let mut vis = vis.clone();
                     let mut name = name.clone();
-                    let item =
-                        self.lower_use_tree(use_tree, &prefix, new_id, &mut vis, &mut name, &attrs);
+                    let mut prefix = prefix.clone();
 
+                    // Give the segments new ids since they are being cloned.
+                    for seg in &mut prefix.segments {
+                        seg.id = self.sess.next_node_id();
+                    }
+
+                    // Each `use` import is an item and thus are owners of the
+                    // names in the path. Up to this point the nested import is
+                    // the current owner, since we want each desugared import to
+                    // own its own names, we have to adjust the owner before
+                    // lowering the rest of the import.
                     self.with_hir_id_owner(new_id, |this| {
+                        let item = this.lower_use_tree(use_tree,
+                                                       &prefix,
+                                                       new_id,
+                                                       &mut vis,
+                                                       &mut name,
+                                                       attrs);
+
                         let vis_kind = match vis.node {
                             hir::VisibilityKind::Public => hir::VisibilityKind::Public,
                             hir::VisibilityKind::Crate(sugar) => hir::VisibilityKind::Crate(sugar),
@@ -3053,7 +3087,6 @@ impl<'a> LoweringContext<'a> {
                                 let id = this.next_id();
                                 hir::VisibilityKind::Restricted {
                                     path: path.clone(),
-                                    // We are allocating a new NodeId here
                                     id: id.node_id,
                                     hir_id: id.hir_id,
                                 }
@@ -3066,7 +3099,7 @@ impl<'a> LoweringContext<'a> {
                             hir::Item {
                                 id: new_id,
                                 hir_id: new_hir_id,
-                                name: name,
+                                name,
                                 attrs: attrs.clone(),
                                 node: item,
                                 vis,
@@ -3630,6 +3663,7 @@ impl<'a> LoweringContext<'a> {
                     0,
                     ParenthesizedGenericArgs::Err,
                     ImplTraitContext::disallowed(),
+                    None,
                 );
                 let args = args.iter().map(|x| self.lower_expr(x)).collect();
                 hir::ExprKind::MethodCall(hir_seg, seg.ident.span, args)
@@ -4483,8 +4517,15 @@ impl<'a> LoweringContext<'a> {
                 } else {
                     self.lower_node_id(id)
                 };
+                let def = self.expect_full_def(id);
                 hir::VisibilityKind::Restricted {
-                    path: P(self.lower_path(id, path, ParamMode::Explicit)),
+                    path: P(self.lower_path_extra(
+                        def,
+                        path,
+                        None,
+                        ParamMode::Explicit,
+                        explicit_owner,
+                    )),
                     id: lowered_id.node_id,
                     hir_id: lowered_id.hir_id,
                 }
@@ -4791,8 +4832,15 @@ impl<'a> LoweringContext<'a> {
         params: Option<P<hir::GenericArgs>>,
         is_value: bool
     ) -> hir::Path {
-        self.resolver
-            .resolve_str_path(span, self.crate_root, components, params, is_value)
+        let mut path = self.resolver
+            .resolve_str_path(span, self.crate_root, components, params, is_value);
+
+        for seg in path.segments.iter_mut() {
+            if let Some(id) = seg.id {
+                seg.id = Some(self.lower_node_id(id).node_id);
+            }
+        }
+        path
     }
 
     fn ty_path(&mut self, id: LoweredNodeId, span: Span, qpath: hir::QPath) -> hir::Ty {
