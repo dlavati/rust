@@ -210,17 +210,22 @@ impl<'a, 'hir> NodeCollector<'a, 'hir> {
                     None => format!("{:?}", node)
                 };
 
-                if hir_id == ::hir::DUMMY_HIR_ID {
-                    debug!("Maybe you forgot to lower the node id {:?}?", id);
-                }
+                let forgot_str = if hir_id == ::hir::DUMMY_HIR_ID {
+                    format!("\nMaybe you forgot to lower the node id {:?}?", id)
+                } else {
+                    String::new()
+                };
 
                 bug!("inconsistent DepNode for `{}`: \
-                      current_dep_node_owner={}, hir_id.owner={}",
+                      current_dep_node_owner={} ({:?}), hir_id.owner={} ({:?}) {}",
                     node_str,
                     self.definitions
                         .def_path(self.current_dep_node_owner)
                         .to_string_no_crate(),
-                    self.definitions.def_path(hir_id.owner).to_string_no_crate())
+                    self.current_dep_node_owner,
+                    self.definitions.def_path(hir_id.owner).to_string_no_crate(),
+                    hir_id.owner,
+                    forgot_str)
             }
         }
 
@@ -317,6 +322,12 @@ impl<'a, 'hir> Visitor<'hir> for NodeCollector<'a, 'hir> {
         });
     }
 
+    fn visit_use(&mut self, path: &'hir Path, id: NodeId, hir_id: HirId) {
+        self.with_dep_node_owner(hir_id.owner, path, |this| {
+            intravisit::walk_use(this, path, id, hir_id)
+        });
+    }
+
     fn visit_foreign_item(&mut self, foreign_item: &'hir ForeignItem) {
         self.insert(foreign_item.id, Node::ForeignItem(foreign_item));
 
@@ -390,6 +401,13 @@ impl<'a, 'hir> Visitor<'hir> for NodeCollector<'a, 'hir> {
         self.with_parent(id, |this| {
             intravisit::walk_stmt(this, stmt);
         });
+    }
+
+    fn visit_path_segment(&mut self, path_span: Span, path_segment: &'hir PathSegment) {
+        if let Some(id) = path_segment.id {
+            self.insert(id, Node::PathSegment(path_segment));
+        }
+        intravisit::walk_path_segment(self, path_span, path_segment);
     }
 
     fn visit_ty(&mut self, ty: &'hir Ty) {
